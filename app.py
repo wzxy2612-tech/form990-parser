@@ -1,16 +1,16 @@
 """
-本地 FastAPI 服务 —— 配合 ngrok 让 Zoho Creator 调用本机解析。
+本地 FastAPI 服務 —— 配合 ngrok 讓 Zoho Creator 調用本機解析。
 
-流程(后台异步, 因为多页 OCR 较慢, 会超过 Deluge 的 invokeurl 超时):
-  Zoho 提交 -> Deluge POST /zoho/webhook -> 本服务立刻回 202
-  后台: Processing_Stage 依次写 Parsing -> Extracting -> Writing Back -> Done/Failed
+流程(後台非同步, 因為多頁 OCR 較慢, 會超過 Deluge 的 invokeurl 超時):
+  Zoho 提交 -> Deluge POST /zoho/webhook -> 本服務立刻回 202
+  後台: Processing_Stage 依次寫 Parsing -> Extracting -> Writing Back -> Done/Failed
 
-本地测试(不接 Zoho): 启动后打开 http://127.0.0.1:8000/docs , 用 /parse-file 直接传 PDF。
-日志: 同时打印到终端并写入 app.log。
+本地測試(不接 Zoho): 啟動後打開 http://127.0.0.1:8000/docs , 用 /parse-file 直接傳 PDF。
+日誌: 同時打印到終端並寫入 app.log。
 
-依赖: pip install fastapi uvicorn[standard] requests python-multipart
-启动: uvicorn app:app --reload --port 8000
-内网穿透: ngrok http 8000
+依賴: pip install fastapi uvicorn[standard] requests python-multipart pdf2image pytesseract
+啟動: uvicorn app:app --reload --port 8000
+內網穿透: ngrok http 8000
 """
 
 import os
@@ -18,7 +18,7 @@ import time
 import base64
 import logging
 
-# 日志: 同时输出到终端和 app.log。force=True 确保覆盖 uvicorn/其他模块可能已设的 root handler。
+# 日誌: 同時輸出到終端和 app.log。force=True 確保覆蓋 uvicorn/其他模組可能已設的 root handler。
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
@@ -37,8 +37,8 @@ from extractor import Form990Data
 app = FastAPI(title="Form 990 Parser")
 
 # ----------------------------------------------------------------------
-# 配置 (用环境变量, 不要把密钥写进代码)
-# ⚠️ Zoho 分数据中心, 域名不同。中国大陆多半是 .com.cn:
+# 配置 (用環境變數, 不要把金鑰寫進程式碼)
+# ⚠️ Zoho 分數據中心, 網域名稱不同。中國大陸多半是 .com.cn:
 #    US: accounts.zoho.com / www.zohoapis.com      CN: accounts.zoho.com.cn / www.zohoapis.com.cn
 # ----------------------------------------------------------------------
 ZOHO_ACCOUNTS = os.getenv("ZOHO_ACCOUNTS_DOMAIN", "https://accounts.zoho.com")
@@ -49,30 +49,54 @@ ZOHO_REFRESH_TOKEN = os.getenv("ZOHO_REFRESH_TOKEN", "")
 ZOHO_OWNER = os.getenv("ZOHO_ACCOUNT_OWNER", "")
 OCR_BACKEND = os.getenv("OCR_BACKEND", "tesseract")
 
-# ↓↓↓ Zoho 字段 link name ↓↓↓
-#  已核实: Processing_Stage / Total_Revenue / Rich_Text1(=你的 Error Log, 富文本) 确实存在。
-#  待你核实: 下面三个目前【不在报表 Form_990_Parser_Report 里】, 需先在 Zoho 把它们加进该
-#           报表的列, 再用 GET 记录看到真实 link name, 然后改这里。改之前回写会自动跳过它们。
+# ↓↓↓ OCR 效能優化配置 ↓↓↓
+MAX_OCR_PAGES = int(os.getenv("MAX_OCR_PAGES", "30"))  # 限制最大解析頁數，防止記憶體溢出
+OCR_DPI = int(os.getenv("OCR_DPI", "200"))            # 300->200 省記憶體/提速; 這類表 200 夠清晰
+
+# ↓↓↓ Zoho 欄位 link name ↓↓↓
+#  已核實: Processing_Stage / Total_Revenue / Rich_Text1(=你的 Error Log, 富文本) 確實存在。
+#  待你核實: 下面三個目前【不在報表 Form_990_Parser_Report 裡】, 需先在 Zoho 把它們加進該
+#           報表的列, 再用 GET 記錄看到真實 link name, 然後改這裡。改之前回寫會自動跳過它們。
 ZOHO_FIELDS = {
-    "stage":               "Processing_Stage",        # ✅ 已确认
-    "revenue":             "Total_Revenue",            # ✅ 已确认
-    "expenses_or_assets":  "Total_Expenses_Assets",    # ❓ 待确认(且需加进报表)
-    "liabilities":         "Liabilities",              # ❓ 待确认(且需加进报表)
-    "exec_comp":           "Executive_Compensation",   # ❓ 待确认(且需加进报表)
-    "error_log":           "Rich_Text1",               # ✅ 实测就是 Rich_Text1
+    "stage":               "Processing_Stage",        # ✅ 已確認
+    "revenue":             "Total_Revenue",            # ✅ 已確認
+    "expenses_or_assets":  "Total_Expenses_Assets",    # ❓ 待確認(且需加進報表)
+    "liabilities":         "Liabilities",              # ❓ 待確認(且需加進報表)
+    "exec_comp":           "Executive_Compensation",   # ❓ 待確認(且需加進報表)
+    "error_log":           "Rich_Text1",               # ✅ 實測就是 Rich_Text1
 }
+
+
+def ocr_tesseract(pdf_bytes, dpi=OCR_DPI, psm=6, max_pages=MAX_OCR_PAGES):
+    """逐頁渲染+OCR, 每頁用完即釋放 -> 峰值記憶體≈單頁, 適配 Render 等小記憶體環境。"""
+    from pdf2image import convert_from_path, pdfinfo_from_path
+    import pytesseract, tempfile
+    cfg = f"--psm {psm}"
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
+        tf.write(pdf_bytes); tmp = tf.name
+    texts = []
+    try:
+        total = pdfinfo_from_path(tmp)["Pages"]
+        for i in range(1, min(max_pages, total) + 1):
+            imgs = convert_from_path(tmp, dpi=dpi, first_page=i, last_page=i)
+            texts.append(pytesseract.image_to_string(imgs[0], config=cfg))
+            imgs[0].close(); del imgs
+        log.info("OCR 完成: %d/%d 頁 (dpi=%d)", len(texts), total, dpi)
+    finally:
+        os.unlink(tmp)
+    return "\n".join(texts)
 
 
 def to_zoho_payload(data: Form990Data, stage: str) -> dict:
     """
-    解析结果 -> Zoho 字段。
-    ⚠️ "Total Expenses / Assets" 含义不明确(英文 Expenses, 中文注 总资产):
-       默认回写【总资产】data.total_assets_eoy; 要总支出改成 data.total_expenses。
+    解析結果 -> Zoho 欄位。
+    ⚠️ "Total Expenses / Assets" 含義不明確(英文 Expenses, 中文注 總資產):
+       預設回寫【總資產】data.total_assets_eoy; 要總支出改成 data.total_expenses。
     """
     return {
         ZOHO_FIELDS["stage"]:              stage,
         ZOHO_FIELDS["revenue"]:            data.total_revenue,
-        ZOHO_FIELDS["expenses_or_assets"]: data.total_assets_eoy,   # ← 默认总资产; 要总支出改这里
+        ZOHO_FIELDS["expenses_or_assets"]: data.total_assets_eoy,   # ← 預設總資產; 要總支出改這裡
         ZOHO_FIELDS["liabilities"]:        data.total_liabilities_eoy,
         ZOHO_FIELDS["exec_comp"]:          data.executive_compensation,
         ZOHO_FIELDS["error_log"]:          "\n".join(data.warnings) if data.warnings else "",
@@ -80,7 +104,7 @@ def to_zoho_payload(data: Form990Data, stage: str) -> dict:
 
 
 # ----------------------------------------------------------------------
-# Zoho Creator 客户端 (v2.1)
+# Zoho Creator 客戶端 (v2.1)
 # ----------------------------------------------------------------------
 def zoho_token() -> str:
     r = requests.post(f"{ZOHO_ACCOUNTS}/oauth/v2/token", params={
@@ -94,7 +118,7 @@ def zoho_token() -> str:
 
 
 def zoho_download_pdf(token, app_link, report_link, record_id, field_link) -> bytes:
-    """从 File Upload 字段下载 PDF。"""
+    """從 File Upload 欄位下載 PDF。"""
     url = (f"{ZOHO_API}/creator/v2.1/data/{ZOHO_OWNER}/{app_link}"
            f"/report/{report_link}/{record_id}/{field_link}/download")
     r = requests.get(url, headers={"Authorization": f"Zoho-oauthtoken {token}"}, timeout=60)
@@ -110,13 +134,13 @@ def zoho_update(token, app_link, report_link, record_id, payload: dict):
                                 "Content-Type": "application/json"},
                        json={"data": payload}, timeout=30)
     if not r.ok:
-        # 把 Zoho 的错误正文带出来 —— 它通常会指明哪个字段 link name 不对
+        # 把 Zoho 的錯誤正文帶出來 —— 它通常會指明哪個欄位 link name 不對
         raise requests.HTTPError(f"{r.status_code} {r.text}", response=r)
     return r.json()
 
 
 def zoho_get_record(token, app_link, report_link, record_id) -> dict:
-    """GET 一条记录, 返回其 data(key 即该报表里实际存在的字段 link name)。"""
+    """GET 一條記錄, 返回其 data(key 即該報表裡實際存在的欄位 link name)。"""
     url = (f"{ZOHO_API}/creator/v2.1/data/{ZOHO_OWNER}/{app_link}"
            f"/report/{report_link}/{record_id}")
     r = requests.get(url, headers={"Authorization": f"Zoho-oauthtoken {token}"}, timeout=30)
@@ -126,30 +150,30 @@ def zoho_get_record(token, app_link, report_link, record_id) -> dict:
 
 
 def filter_existing(payload: dict, existing_keys: set):
-    """拆成 (报表里存在的部分, 不存在被跳过的 key 列表)。"""
+    """拆成 (報表裡存在的部分, 不存在被跳過的 key 列表)。"""
     kept = {k: v for k, v in payload.items() if k in existing_keys}
     dropped = [k for k in payload if k not in existing_keys]
     return kept, dropped
 
 
 def _set_stage(token, app_link, report_link, record_id, stage, error=""):
-    """只更新状态(和错误日志)。"""
+    """只更新狀態(和錯誤日誌)。"""
     payload = {ZOHO_FIELDS["stage"]: stage}
     if error:
         payload[ZOHO_FIELDS["error_log"]] = error
     try:
         zoho_update(token, app_link, report_link, record_id, payload)
     except Exception as e:
-        log.warning("更新状态失败: %s", e)
-        if error:  # Error_Log 字段名也可能不对 -> 退而只更新状态, 至少让 Failed 显示
+        log.warning("更新狀態失敗: %s", e)
+        if error:  # Error_Log 欄位名也可能不對 -> 退而只更新狀態, 至少讓 Failed 顯示
             try:
                 zoho_update(token, app_link, report_link, record_id, {ZOHO_FIELDS["stage"]: stage})
             except Exception as e2:
-                log.warning("仅更新状态也失败: %s", e2)
+                log.warning("僅更新狀態也失敗: %s", e2)
 
 
 # ----------------------------------------------------------------------
-# 后台处理: 下载 -> 解析(计时) -> 回写(只写报表里存在的字段)
+# 後台處理: 下載 -> 解析(計時) -> 回寫(只寫報表裡存在的欄位)
 # ----------------------------------------------------------------------
 def process_record(app_link, report_link, record_id, pdf_field,
                    pdf_b64=None, pdf_bytes=None):
@@ -157,12 +181,12 @@ def process_record(app_link, report_link, record_id, pdf_field,
     try:
         token = zoho_token()
     except Exception as e:
-        log.warning("拿 Zoho token 失败 -> 回写会跳过, 但仍会解析并打印结果: %s", e)
+        log.warning("拿 Zoho token 失敗 -> 回寫會跳過, 但仍會解析並列印結果: %s", e)
 
     if token:
         _set_stage(token, app_link, report_link, record_id, "Parsing")
 
-    # 1) 取 PDF 字节
+    # 1) 取 PDF 位元組
     if pdf_bytes is None:
         try:
             if pdf_b64:
@@ -170,29 +194,29 @@ def process_record(app_link, report_link, record_id, pdf_field,
             elif token:
                 pdf_bytes = zoho_download_pdf(token, app_link, report_link, record_id, pdf_field)
             else:
-                log.error("既没有直传文件, 也没有 token 可下载, 中止")
+                log.error("既沒有直傳文件, 也沒有 token 可下載, 中止")
                 return
         except Exception as e:
-            log.exception("获取 PDF 失败")
+            log.exception("獲取 PDF 失敗")
             if token:
                 _set_stage(token, app_link, report_link, record_id, "Failed", error=str(e))
             return
 
-    # 2) 解析(计时)
+    # 2) 解析(計時)
     if token:
         _set_stage(token, app_link, report_link, record_id, "Extracting")
     try:
         t0 = time.time()
         data = parse_pdf(pdf_bytes, ocr_backend=OCR_BACKEND)
-        log.info("解析(含 OCR)耗时 %.1fs", time.time() - t0)
+        log.info("解析(含 OCR)耗時 %.1fs", time.time() - t0)
     except Exception as e:
-        log.exception("解析失败")
+        log.exception("解析失敗")
         if token:
             _set_stage(token, app_link, report_link, record_id, "Failed", error=str(e))
         return
-    log.info("记录 %s 解析结果: %s", record_id, data.to_dict())
+    log.info("記錄 %s 解析結果: %s", record_id, data.to_dict())
 
-    # 3) 回写 Zoho —— 只写"该报表里实际存在"的字段, 缺的跳过并记录(避免一个坏字段拖垮整次写入)
+    # 3) 回寫 Zoho —— 只寫"該報表裡實際存在"的欄位, 缺的跳過並記錄(避免一個壞欄位拖垮整次寫入)
     if token:
         try:
             _set_stage(token, app_link, report_link, record_id, "Writing Back")
@@ -200,20 +224,20 @@ def process_record(app_link, report_link, record_id, pdf_field,
             full = to_zoho_payload(data, "Done")
             payload, dropped = filter_existing(full, existing)
             if dropped:
-                msg = "未写入(字段不在报表中, 请加进报表并核对 link name): " + ", ".join(dropped)
-                log.warning("[报表=%s] %s", report_link, msg)
-                # 把"缺哪些字段"也写进 Error Log, 让你在 Zoho 里直接看到
+                msg = "未寫入(欄位不在報表中, 請加進報表並核對 link name): " + ", ".join(dropped)
+                log.warning("[報表=%s] %s", report_link, msg)
+                # 把"缺哪些欄位"也寫進 Error Log, 讓你在 Zoho 裡直接看到
                 if ZOHO_FIELDS["error_log"] in payload:
                     payload[ZOHO_FIELDS["error_log"]] = msg
             zoho_update(token, app_link, report_link, record_id, payload)
-            log.info("回写成功, 已写入字段: %s", list(payload.keys()))
+            log.info("回寫成功, 已寫入欄位: %s", list(payload.keys()))
         except Exception as e:
-            log.warning("回写 Zoho 失败: %s", e)
+            log.warning("回寫 Zoho 失敗: %s", e)
             _set_stage(token, app_link, report_link, record_id, "Failed", error=str(e))
 
 
 # ----------------------------------------------------------------------
-# 工具: 从请求里把"文本参数 + 文件"都收齐(query / multipart / JSON 都兼容)
+# 工具: 從請求裡把"文本參數 + 文件"都收齊(query / multipart / JSON 都兼容)
 # ----------------------------------------------------------------------
 async def collect_request(request: Request):
     query_fields = dict(request.query_params)
@@ -226,7 +250,7 @@ async def collect_request(request: Request):
             if hasattr(value, "filename") and value.filename is not None:
                 pdf_bytes = await value.read()
                 pdf_name, file_key = value.filename, key
-                log.info("收到文件: 字段名='%s' filename='%s' (%d bytes)",
+                log.info("收到文件: 欄位名='%s' filename='%s' (%d bytes)",
                          key, pdf_name, len(pdf_bytes))
             else:
                 form_fields[key] = value
@@ -245,7 +269,7 @@ async def collect_request(request: Request):
 
 
 # ----------------------------------------------------------------------
-# 端点
+# 端點
 # ----------------------------------------------------------------------
 @app.get("/")
 def health():
@@ -254,16 +278,16 @@ def health():
 
 @app.post("/parse-file")
 async def parse_file(file: UploadFile = File(...)):
-    """本地测试用: 直接上传 PDF, 同步返回解析 JSON (不碰 Zoho)。"""
+    """本地測試用: 直接上傳 PDF, 同步返回解析 JSON (不碰 Zoho)。"""
     t0 = time.time()
-    data = parse_pdf(await file.read(), ocr_backend=OCR_BACKEND)
-    log.info("/parse-file 解析耗时 %.1fs", time.time() - t0)
+    data = parse_pdf(await file.read(), oauthtoken=None)  # 備註：此處如需整合 ocr_tesseract 可於 parser 內調用
+    log.info("/parse-file 解析耗時 %.1fs", time.time() - t0)
     return data.to_dict()
 
 
 @app.post("/zoho/debug")
 async def debug_webhook(request: Request):
-    """调试用: 回显 query 和表单两边收到的所有字段(含文件字段名+大小), 不解析、秒回。"""
+    """調試用: 回顯 query 和表單兩邊收到的所有欄位(含文件欄位名+大小), 不解析、秒回。"""
     merged, query_fields, form_fields, pdf_bytes, pdf_name, file_key = await collect_request(request)
     out = {
         "content_type": request.headers.get("content-type", ""),
@@ -280,14 +304,14 @@ async def debug_webhook(request: Request):
 @app.post("/zoho/webhook")
 async def zoho_webhook(request: Request, bg: BackgroundTasks):
     """
-    Zoho Deluge 调用这里。文本参数无论在 query 还是 multipart 表单体都能收到,
-    文件按"有 filename 的那项"自动识别。立即返回 202, OCR 在后台跑。
+    Zoho Deluge 調用這裡。文本參數無論在 query 還是 multipart 表單體都能收到,
+    文件按"有 filename 的那項"自動識別。立即返回 202, OCR 在後台跑。
     """
     merged, query_fields, form_fields, pdf_bytes, pdf_name, file_key = await collect_request(request)
 
-    # 保险: 收到的"文件"过小(如 Deluge 推来的占位)说明不是真 PDF, 忽略它, 改用 Zoho API 下载。
+    # 保險: 收到的"文件"過小(如 Deluge 推來的占位)說明不是真 PDF, 忽略它, 改用 Zoho API 下載。
     if pdf_bytes is not None and len(pdf_bytes) < 1000:
-        log.warning("收到的文件仅 %d 字节, 不像真 PDF -> 忽略, 改用 Zoho API 下载", len(pdf_bytes))
+        log.warning("收到的文件僅 %d 位元組, 不像真 PDF -> 忽略, 改用 Zoho API 下載", len(pdf_bytes))
         pdf_bytes = file_key = pdf_name = None
 
     record_id = merged.get("record_id")
