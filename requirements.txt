@@ -1,0 +1,8 @@
+pdfplumber
+pdf2image
+pytesseract
+fastapi
+uvicorn[standard]
+requests
+python-multipart
+boto3
